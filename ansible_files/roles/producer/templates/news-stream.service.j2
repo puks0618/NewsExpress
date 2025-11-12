@@ -1,0 +1,16 @@
+[Unit]
+Description=News API to Kafka Producer
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 {{ producer_script_dest }}/producer.py
+WorkingDirectory={{ producer_script_dest }}
+Environment=NEWS_API_KEY={{ news_api_key }}
+Restart=on-failure
+RestartSec=10
+StandardOutput=file:/var/log/{{ kafka_topic }}.out
+StandardError=file:/var/log/{{ kafka_topic }}.err
+
+[Install]
+WantedBy=multi-user.target

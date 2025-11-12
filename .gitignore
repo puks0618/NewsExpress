@@ -1,0 +1,10 @@
+*.pub
+*key
+.terraform
+*.tfstate
+*.backup
+*.tfstate.* 
+.env
+newsenv
+
+

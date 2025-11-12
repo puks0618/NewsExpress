@@ -1,0 +1,112 @@
+---
+- name: Install Java
+  apt:
+    name: openjdk-11-jdk-headless
+    state: present
+    update_cache: yes
+
+- name: Create Kafka user
+  user:
+    name: "{{ kafka_user }}"
+    createhome: true
+    shell: /bin/bash
+
+- name: Create Kafka installation directory
+  file:
+    path: "{{ kafka_install_dir }}"
+    state: directory
+    owner: "{{ kafka_user }}"
+    group: "{{ kafka_user }}"
+    mode: '0755'
+
+- name: Download Kafka
+  get_url:
+    url: "https://dlcdn.apache.org/kafka/{{ kafka_version }}/kafka_{{ scala_version }}-{{ kafka_version }}.tgz"
+    dest: "/tmp/kafka_{{ scala_version }}-{{ kafka_version }}.tgz"
+    checksum: "sha512:{{ kafka_checksum }}"
+
+- name: Extract Kafka
+  unarchive:
+    src: "/tmp/kafka_{{ scala_version }}-{{ kafka_version }}.tgz"
+    dest: "{{ kafka_install_dir }}"
+    remote_src: yes
+    extra_opts: [--strip-components=1]
+    creates: "{{ kafka_install_dir }}/bin/kafka-server-start.sh"
+
+- name: Set correct permissions for Kafka directory
+  file:
+    path: "{{ kafka_install_dir }}"
+    owner: "{{ kafka_user }}"
+    group: "{{ kafka_user }}"
+    recurse: yes
+
+- name: Create Kafka data directory
+  file:
+    path: "{{ kafka_data_dir }}"
+    state: directory
+    owner: "{{ kafka_user }}"
+    group: "{{ kafka_user }}"
+    mode: '0755'
+
+- name: Create ZooKeeper data directory
+  file:
+    path: "{{ zookeeper_data_dir }}"
+    state: directory
+    owner: "{{ kafka_user }}"
+    group: "{{ kafka_user }}"
+    mode: '0755'
+
+- name: Create systemd service file for ZooKeeper
+  template:
+    src: zookeeper.service.j2
+    dest: /etc/systemd/system/zookeeper.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Create systemd service file for Kafka
+  template:
+    src: kafka.service.j2
+    dest: /etc/systemd/system/kafka.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+
+- name: Start and enable ZooKeeper
+  systemd:
+    name: zookeeper
+    state: started
+    enabled: yes
+
+- name: Start and enable Kafka
+  systemd:
+    name: kafka
+    state: started
+    enabled: yes
+
+- name: Ensure Kafka service is active
+  systemd:
+    name: kafka
+  register: kafka_service
+
+- name: Fail if Kafka service failed to start
+  fail:
+    msg: "Kafka service failed to start!"
+  when: kafka_service.status.ActiveState != "active"
+
+- name: Create Kafka topic 'news-stream' with 1 day retention
+  command: >
+    {{ kafka_install_dir }}/bin/kafka-topics.sh
+    --create
+    --topic news-stream
+    --bootstrap-server localhost:9092
+    --partitions 1
+    --replication-factor 1
+    --config retention.ms=86400000 
+    --config cleanup.policy=delete
+    --if-not-exists
+

@@ -1,0 +1,145 @@
+---
+- name: Update apt package list
+  apt:
+    update_cache: yes
+
+- name: Ensure Java is installed
+  apt:
+    name: openjdk-11-jdk
+    state: present
+
+- name: Set global environment variables in /etc/environment
+  copy:
+    dest: /etc/environment
+    content: |
+      SPARK_HOME="{{ spark_home }}"
+      PYSPARK_PYTHON="{{ pyspark_python }}"
+      PYSPARK_DRIVER_PYTHON="{{ pyspark_driver_python }}"
+      KAFKA_BROKER="{{ kafka_broker }}"
+      KAFKA_TOPIC="{{ kafka_topic }}"
+      TEMP_BUCKET="{{ temp_bucket }}"
+      BQ_DATASET_ID="{{ bq_dataset_id }}"
+      TABLE_NAME="{{ table_name }}"
+    owner: root
+    group: root
+    mode: '0644'
+
+
+- name: Create a spark user
+  user:
+    name: "{{ spark_user }}"
+    shell: /bin/bash
+    create_home: yes
+
+- name: Download Spark
+  get_url:
+    url: "https://downloads.apache.org/spark/spark-{{ spark_version }}/{{ spark_package }}.tgz"
+    dest: "/tmp/{{ spark_package }}.tgz"
+
+- name: Extract Spark
+  unarchive:
+    src: "/tmp/{{ spark_package }}.tgz"
+    dest: /opt/
+    remote_src: yes
+    owner: "{{ spark_user }}"
+    group: "{{ spark_group }}"
+
+- name: Create a symbolic link to Spark
+  file:
+    src: "/opt/{{ spark_package }}"
+    dest: "{{ spark_home }}"
+    state: link
+    owner: "{{ spark_user }}"
+    group: "{{ spark_group }}"
+
+- name: Set SPARK_HOME environment variable
+  lineinfile:
+    path: /etc/profile.d/spark.sh
+    line: 'export SPARK_HOME={{ spark_home }}'
+    create: yes
+
+- name: Add Spark to PATH
+  lineinfile:
+    path: /etc/profile.d/spark.sh
+    line: 'export PATH=$PATH:{{ spark_home }}/bin:{{ spark_home }}/sbin'
+    create: yes
+
+- name: Source environment variables
+  shell: . /etc/profile.d/spark.sh
+  args:
+    executable: /bin/bash
+  ignore_errors: yes
+
+- name: Ensure Python 3 and pip are installed
+  apt:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - python3
+    - python3-pip
+
+- name: Copy requirements.txt to the target machine
+  copy:
+    src: requirements.txt
+    dest: /home/{{ spark_user }}/requirements.txt
+    owner: "{{ spark_user }}"
+    group: "{{ spark_group }}"
+
+- name: Install Python packages from requirements.txt
+  pip:
+    requirements: /home/{{ spark_user }}/requirements.txt
+    executable: pip3
+
+- name: Create directory for consumer
+  file:
+    path: "{{ consumer_script_dest }}"
+    state: directory
+    mode: '0755'
+
+- name: Copy consumer script template
+  template:
+    src: consumer.py.j2
+    dest: "{{ consumer_script_dest }}/consumer.py"
+    mode: '0755'
+
+- name: Download GCS connector for Hadoop 3
+  get_url:
+    url: https://storage.googleapis.com/hadoop-lib/gcs/gcs-connector-hadoop3-latest.jar
+    dest: /opt/spark/jars/gcs-connector-hadoop3-latest.jar
+    mode: '0644'
+
+
+- name: Ensure Kafka client libraries are installed
+  apt:
+    name: librdkafka-dev
+    state: present
+
+- name: Deploy PySpark service file
+  template:
+    src: pyspark-news-stream.service.j2
+    dest: /etc/systemd/system/pyspark-news-stream.service
+  notify:
+    - Reload systemd
+
+- name: Enable and start PySpark service
+  systemd:
+    name: pyspark-news-stream
+    enabled: yes
+    state: started
+
+- name: Check PySpark service status
+  systemd:
+    name: pyspark-news-stream
+    state: started
+  register: pyspark_service_status
+
+- name: Debug - Print PySpark service status
+  debug:
+    var: pyspark_service_status
+
+# - name: Ensure cron job to restart PySpark service
+#   cron:
+#     name: "Restart PySpark News Stream Service"
+#     user: root
+#     job: "/bin/systemctl restart pyspark-news-stream"
+#     minute: "*/30"  # Adjust the interval as needed

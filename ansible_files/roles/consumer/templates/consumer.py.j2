@@ -1,0 +1,171 @@
+import os
+import uuid
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_json, col, sha2, concat_ws, current_timestamp
+from pyspark.sql.types import StringType, StructType, StructField
+from google.cloud import bigquery
+
+# Get environment variables
+kafka_broker   = os.environ.get("KAFKA_BROKER")
+kafka_topic    = os.environ.get("KAFKA_TOPIC")
+temp_bucket    = os.environ.get("TEMP_BUCKET")
+bq_dataset_id  = os.environ.get("BQ_DATASET_ID")
+table_name     = os.environ.get("TABLE_NAME")
+
+# Paths and packages
+GCS_JAR_PATH = "/opt/spark/jars/gcs-connector-hadoop3-latest.jar"
+PACKAGES = ",".join([
+    "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0",
+    "com.google.cloud.spark:spark-3.5-bigquery:0.42.1"
+])
+
+# Build Spark session, making sure both Kafka & BigQuery connectors and the GCS JAR are on the classpath
+spark = SparkSession.builder \
+    .appName("KafkaToBigQuery") \
+    .config("spark.jars.packages", PACKAGES) \
+    .config("spark.jars", GCS_JAR_PATH) \
+    .config("spark.driver.extraClassPath", GCS_JAR_PATH) \
+    .config("spark.executor.extraClassPath", GCS_JAR_PATH) \
+    .getOrCreate()
+
+# Define schema
+schema = StructType([
+    StructField("source", StructType([
+        StructField("id",   StringType()),
+        StructField("name", StringType())
+    ])),
+    StructField("author",      StringType()),
+    StructField("title",       StringType()),
+    StructField("description", StringType()),
+    StructField("publishedAt", StringType()),
+    StructField("content",     StringType()),  # Added field
+    StructField("url",         StringType()),  # Added field
+    StructField("urlToImage",  StringType())   # Added field
+])
+
+# Read from Kafka
+df = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", kafka_broker) \
+    .option("subscribe", kafka_topic) \
+    .option("startingOffsets", "earliest") \
+    .load()
+
+# Parse JSON payload
+json_df = df.selectExpr("CAST(value AS STRING) as json") \
+    .select(from_json(col("json"), schema).alias("data")) \
+    .select("data.*")
+
+# Add a deterministic UUID column using SHA-256 hash of the concatenated fields
+json_df = json_df.withColumn("uuid", sha2(concat_ws("||", col("title"), col("publishedAt"), col("source.name")), 256))
+# Add ingestion time
+json_df = json_df.withColumn("ingestion_time", current_timestamp())
+
+# Initialize BigQuery client 
+client = bigquery.Client()
+
+create_target_query = f"""
+CREATE TABLE IF NOT EXISTS `{bq_dataset_id}.{table_name}` (
+    uuid STRING,
+    title STRING,
+    publishedAt STRING,
+    description STRING,
+    author STRING,    
+    content STRING,
+    url STRING,
+    urlToImage STRING,
+    source STRUCT<id STRING, name STRING>,
+    ingestion_time TIMESTAMP
+)
+"""
+
+try:
+    client.query(create_target_query).result()
+except Exception as e:
+    print(f"Error creating table: {e}")
+
+print("Target table ensured.")
+
+
+# Deduplication function to run after each batch write (MERGE approach)
+def deduplicate_in_bigquery():
+    query = f"""
+    MERGE INTO `{bq_dataset_id}.{table_name}` T
+    USING (
+        SELECT * FROM (
+            SELECT 
+                uuid, 
+                title, 
+                publishedAt, 
+                description, 
+                author, 
+                content, 
+                url, 
+                urlToImage, 
+                source, 
+                ingestion_time,
+                ROW_NUMBER() OVER (PARTITION BY uuid ORDER BY ingestion_time DESC) AS row_num
+            FROM `{bq_dataset_id}.{table_name}_staging`
+        )
+        WHERE row_num = 1
+    ) S
+    ON T.uuid = S.uuid
+    WHEN MATCHED THEN
+        UPDATE SET
+            T.title = S.title, 
+            T.publishedAt = S.publishedAt, 
+            T.description = S.description, 
+            T.author = S.author, 
+            T.content = S.content,
+            T.url = S.url,
+            T.urlToImage = S.urlToImage,
+            T.source = S.source,
+            T.ingestion_time = S.ingestion_time
+    WHEN NOT MATCHED THEN
+        INSERT (uuid, title, publishedAt, description, author, content, url, urlToImage, source, ingestion_time)
+        VALUES (S.uuid, S.title, S.publishedAt, S.description, S.author, S.content, S.url, S.urlToImage, S.source, S.ingestion_time)
+    """
+    
+    # Run the deduplication query
+    try:
+        query_job = client.query(query)
+        query_job.result()
+    except Exception as e:
+        print(f"Error during BigQuery operation: {e}")
+
+    delete_staging_query = f"""
+    DELETE FROM `{bq_dataset_id}.{table_name}_staging`
+    WHERE ingestion_time < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 DAY);
+    """    
+
+    try:
+        client.query(delete_staging_query).result()
+        print("Staging table cleaned up.")
+    except Exception as e:
+        print(f"Error deleting staging records: {e}")
+
+    print("Deduplication and cleanup completed in BigQuery.")
+
+
+def write_batch_to_bq(batch_df, batch_id):
+    # Write the batch data to BigQuery staging table
+    batch_df.write \
+        .format("bigquery") \
+        .option("table", f"{bq_dataset_id}.{table_name}_staging") \
+        .option("temporaryGcsBucket", temp_bucket) \
+        .mode("append") \
+        .save()
+
+    # Deduplicate in BigQuery after each batch write
+    deduplicate_in_bigquery()
+
+# Start streaming to BigQuery
+query = json_df.writeStream \
+    .outputMode("append") \
+    .option("checkpointLocation", f"gs://{temp_bucket}/bq_checkpoints/") \
+    .foreachBatch(write_batch_to_bq) \
+    .trigger(processingTime="30 minutes") \
+    .start()
+
+# Await termination
+query.awaitTermination()
