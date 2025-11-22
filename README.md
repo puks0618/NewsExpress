@@ -28,12 +28,6 @@ The pipeline consists of the following components:
 * **Java**: Java 11 or later
 
 
-
-
-
-
-
-
 # Terraform and Ansible
 
 This projects deploys Apache Kafka on Google Cloud Platform (GCP) using Terraform for instance creation & provision, Ansible for Spark, Kafka & Zookeeper, Python, pip and modules installation. Ansible files in the form of Terraform templates are rendered dynamically and provisioned to VMs. A new VPC is created, with a public subnet for control VM and a private subnet with a NAT Gateway for Kafka VM, Python producer VM and Spark Consumer VM.
@@ -54,23 +48,7 @@ To deploy Kafka on GCP:
 
 3. **Install Kafka and Zookeeper**: On Kafka VM, install the required software packages using Ansible (started upon creation and provision of VMs by Terraform with remote-exec). 
 
-   ![Kafka Setup](./pngs/setup.png)
-
 5. **Configure Networking**: Set up appropriate firewall rules and networking configurations to allow communication between nodes.
 
 6. **Start Services**: Initiate Zookeeper and then start the Kafka brokers, defined as Ansible tasks.
 
-   ![Kafka](./pngs/kafka.png)
-
-   ![Zookeeper](./pngs/zookeeper.png)
-
-
-
-
-
-
-
-
-## License
-
-This project is licensed under the MIT License. See the `LICENSE` file for details.
