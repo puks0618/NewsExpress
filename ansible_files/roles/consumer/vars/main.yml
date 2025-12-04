@@ -1,6 +1,5 @@
-bq_dataset_id: "api-project-269968866265.4678823"
-table_name: "news_table"
-spark_version: "3.5.5"
+# Consumer Configuration
+spark_version: "3.5.7"
 spark_package: "spark-{{ spark_version }}-bin-hadoop3"
 spark_user: "spark"
 spark_group: "spark"
@@ -10,3 +9,6 @@ gcs_connector_version: "latest"
 bigquery_connector_version: "0.42.1"
 pyspark_driver_python: "python3"
 pyspark_python: "python3"
+
+# BigQuery table names
+table_name: "news_table"

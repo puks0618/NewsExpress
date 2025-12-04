@@ -1,4 +1,6 @@
-pyspark
+pyspark==3.5.0
 google-cloud-bigquery
 google-cloud-storage
 kafka-python
+textblob
+numpy

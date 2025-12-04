@@ -40,8 +40,10 @@ data "template_file" "consumer_defaults_main_yml" {
   template = file("../ansible_files/roles/consumer/defaults/main.yml.tpl")
 
   vars = {
-    temp_bucket_name = google_storage_bucket.temp_bucket.name
+    temp_bucket_name        = google_storage_bucket.temp_bucket.name
     kafka_server_private_ip = google_compute_instance.kafka_instance.network_interface.0.network_ip
+    project_id              = var.project_id
+    epsilon                 = var.epsilon
   }
 }
 
@@ -97,5 +99,3 @@ resource "local_file" "ansible_consumer_defaults_main_yml" {
   content  = data.template_file.consumer_defaults_main_yml.rendered
   filename = "../ansible_files/roles/consumer/defaults/main.yml"
 }
-
-

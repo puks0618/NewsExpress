@@ -1,0 +1,22 @@
+[
+  {"name": "uuid", "type": "STRING", "mode": "REQUIRED", "description": "Unique article identifier"},
+  {"name": "source_id", "type": "STRING", "mode": "NULLABLE", "description": "Source ID from NewsAPI"},
+  {"name": "source_name", "type": "STRING", "mode": "NULLABLE", "description": "Source name"},
+  {"name": "author", "type": "STRING", "mode": "NULLABLE", "description": "Original author (raw)"},
+  {"name": "author_hashed", "type": "STRING", "mode": "NULLABLE", "description": "SHA-256 hashed author (k-anonymity)"},
+  {"name": "title", "type": "STRING", "mode": "NULLABLE", "description": "Article title"},
+  {"name": "description", "type": "STRING", "mode": "NULLABLE", "description": "Article description"},
+  {"name": "url", "type": "STRING", "mode": "NULLABLE", "description": "Article URL"},
+  {"name": "urlToImage", "type": "STRING", "mode": "NULLABLE", "description": "Image URL"},
+  {"name": "publishedAt", "type": "STRING", "mode": "NULLABLE", "description": "Original publish timestamp"},
+  {"name": "date_generalized", "type": "STRING", "mode": "NULLABLE", "description": "Generalized date (k-anonymity)"},
+  {"name": "content", "type": "STRING", "mode": "NULLABLE", "description": "Article content"},
+  {"name": "sentiment_score", "type": "FLOAT", "mode": "NULLABLE", "description": "Sentiment score (-1 to 1)"},
+  {"name": "sentiment_label", "type": "STRING", "mode": "NULLABLE", "description": "POSITIVE/NEGATIVE/NEUTRAL"},
+  {"name": "subjectivity", "type": "FLOAT", "mode": "NULLABLE", "description": "Subjectivity score (0 to 1)"},
+  {"name": "lsh_signature", "type": "STRING", "mode": "REPEATED", "description": "LSH signature (first 10 hashes)"},
+  {"name": "k_anonymity_group_size", "type": "INTEGER", "mode": "NULLABLE", "description": "K-anonymity group size"},
+  {"name": "l_diversity_count", "type": "INTEGER", "mode": "NULLABLE", "description": "L-diversity distinct values"},
+  {"name": "ingested_at", "type": "STRING", "mode": "NULLABLE", "description": "Kafka ingestion timestamp"},
+  {"name": "processed_at", "type": "STRING", "mode": "NULLABLE", "description": "Spark processing timestamp"}
+]

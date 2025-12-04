@@ -1,0 +1,14 @@
+[
+  {"name": "uuid", "type": "STRING", "mode": "REQUIRED", "description": "Unique article identifier"},
+  {"name": "source_id", "type": "STRING", "mode": "NULLABLE", "description": "Source ID"},
+  {"name": "source_name", "type": "STRING", "mode": "NULLABLE", "description": "Source name"},
+  {"name": "author", "type": "STRING", "mode": "NULLABLE", "description": "Author name"},
+  {"name": "title", "type": "STRING", "mode": "NULLABLE", "description": "Article title"},
+  {"name": "description", "type": "STRING", "mode": "NULLABLE", "description": "Article description"},
+  {"name": "url", "type": "STRING", "mode": "NULLABLE", "description": "Article URL"},
+  {"name": "urlToImage", "type": "STRING", "mode": "NULLABLE", "description": "Image URL"},
+  {"name": "publishedAt", "type": "STRING", "mode": "NULLABLE", "description": "Publish timestamp"},
+  {"name": "content", "type": "STRING", "mode": "NULLABLE", "description": "Article content"},
+  {"name": "ingested_at", "type": "STRING", "mode": "NULLABLE", "description": "Ingestion timestamp"},
+  {"name": "processed_at", "type": "STRING", "mode": "NULLABLE", "description": "Processing timestamp"}
+]

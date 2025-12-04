@@ -1,0 +1,4 @@
+producer_instance_private_ip: "172.20.2.2"
+kafka_instance_private_ip: "172.20.2.3"
+control_instance_public_ip: "104.154.246.216"
+consumer_instance_public_ip: "172.20.2.4"

@@ -1,0 +1,12 @@
+# Kafka Configuration
+kafka_topic: "news-stream"
+kafka_broker: "172.20.2.3:9092"
+
+# GCS Configuration
+temp_bucket: "newsexpress-temp-358785751865"
+
+# BigQuery Configuration
+bq_dataset_id: "kafka-news-stream-1762484628.news_stream"
+
+# Privacy Configuration
+epsilon: "0.5"

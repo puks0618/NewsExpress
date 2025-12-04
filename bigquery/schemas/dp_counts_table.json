@@ -1,0 +1,8 @@
+[
+  {"name": "count_type", "type": "STRING", "mode": "REQUIRED", "description": "Type: source or topic"},
+  {"name": "category", "type": "STRING", "mode": "REQUIRED", "description": "Source name or topic name"},
+  {"name": "true_count", "type": "INTEGER", "mode": "NULLABLE", "description": "Actual count (for validation)"},
+  {"name": "noisy_count", "type": "INTEGER", "mode": "REQUIRED", "description": "Differentially private count"},
+  {"name": "epsilon", "type": "FLOAT", "mode": "NULLABLE", "description": "Privacy budget epsilon"},
+  {"name": "timestamp", "type": "STRING", "mode": "NULLABLE", "description": "Computation timestamp"}
+]

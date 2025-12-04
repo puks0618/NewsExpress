@@ -1,0 +1,9 @@
+[
+  {"name": "uuid", "type": "STRING", "mode": "REQUIRED", "description": "Unique article identifier"},
+  {"name": "title", "type": "STRING", "mode": "NULLABLE", "description": "Article title"},
+  {"name": "source_name", "type": "STRING", "mode": "NULLABLE", "description": "Source name"},
+  {"name": "sentiment_score", "type": "FLOAT", "mode": "NULLABLE", "description": "Sentiment score (-1 to 1)"},
+  {"name": "sentiment_label", "type": "STRING", "mode": "NULLABLE", "description": "POSITIVE/NEGATIVE/NEUTRAL"},
+  {"name": "subjectivity", "type": "FLOAT", "mode": "NULLABLE", "description": "Subjectivity score (0 to 1)"},
+  {"name": "processed_at", "type": "STRING", "mode": "NULLABLE", "description": "Processing timestamp"}
+]

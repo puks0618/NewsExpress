@@ -1,171 +1,1013 @@
+#!/usr/bin/env python3
+"""
+NewsExpress Spark Streaming Consumer
+=====================================
+Implements:
+- Streaming Algorithms: Reservoir Sampling, Flajolet-Martin, DGIM, Computing Moments
+- LSH Pipeline: Shingling, MinHash (128 hashes), 5 bands, similarity detection
+- Privacy: K-Anonymity (k=5), L-Diversity (l=3), Differential Privacy (epsilon=0.5)
+- Sentiment Analysis: TextBlob classification with scores
+"""
+
 import os
+import json
+import hashlib
+import random
+import math
+import re
 import uuid
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, sha2, concat_ws, current_timestamp
-from pyspark.sql.types import StringType, StructType, StructField
+from datetime import datetime
+from collections import defaultdict
+from typing import List, Dict, Tuple, Set
+
+import numpy as np
+from textblob import TextBlob
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import (
+    from_json, col, udf, current_timestamp, lit,
+    to_date, count, collect_list, struct, explode,
+    monotonically_increasing_id, when, array
+)
+from pyspark.sql.types import (
+    StringType, StructType, StructField, FloatType,
+    BooleanType, ArrayType, IntegerType, DoubleType,
+    TimestampType, LongType
+)
 from google.cloud import bigquery
 
-# Get environment variables
-kafka_broker   = os.environ.get("KAFKA_BROKER")
-kafka_topic    = os.environ.get("KAFKA_TOPIC")
-temp_bucket    = os.environ.get("TEMP_BUCKET")
-bq_dataset_id  = os.environ.get("BQ_DATASET_ID")
-table_name     = os.environ.get("TABLE_NAME")
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "{{ kafka_broker }}")
+KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "{{ kafka_topic }}")
+TEMP_BUCKET = os.environ.get("TEMP_BUCKET", "{{ temp_bucket }}")
+BQ_DATASET_ID = os.environ.get("BQ_DATASET_ID", "{{ bq_dataset_id }}")
+TABLE_NAME = os.environ.get("TABLE_NAME", "{{ table_name }}")
 
-# Paths and packages
+# Privacy Configuration
+EPSILON = float(os.environ.get("EPSILON", "0.5"))  # Differential privacy epsilon
+K_ANONYMITY = 5  # Minimum group size
+L_DIVERSITY = 3  # Minimum distinct sensitive values
+
+# LSH Configuration
+NUM_HASH_FUNCTIONS = 128  # MinHash permutations
+NUM_BANDS = 5  # LSH bands
+SIMILARITY_THRESHOLD = 0.5
+SHINGLE_SIZE = 3  # 3-word shingles
+
+# Reservoir Sampling Configuration
+RESERVOIR_SIZE = 1000
+
+# Spark Configuration
 GCS_JAR_PATH = "/opt/spark/jars/gcs-connector-hadoop3-latest.jar"
 PACKAGES = ",".join([
     "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0",
     "com.google.cloud.spark:spark-3.5-bigquery:0.42.1"
 ])
 
-# Build Spark session, making sure both Kafka & BigQuery connectors and the GCS JAR are on the classpath
+# =============================================================================
+# 1. STREAMING ALGORITHMS
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1.1 RESERVOIR SAMPLING
+# -----------------------------------------------------------------------------
+class ReservoirSampler:
+    """
+    Reservoir Sampling: Maintain fixed-size random sample (1000 articles)
+    Uniform probability selection using Algorithm R
+    """
+
+    def __init__(self, size: int = RESERVOIR_SIZE):
+        self.size = size
+        self.reservoir = []
+        self.count = 0
+
+    def add(self, item: dict) -> bool:
+        """Add item to reservoir with proper probability"""
+        self.count += 1
+
+        if len(self.reservoir) < self.size:
+            self.reservoir.append(item)
+            return True
+        else:
+            # Replace with probability size/count
+            j = random.randint(0, self.count - 1)
+            if j < self.size:
+                self.reservoir[j] = item
+                return True
+        return False
+
+    def get_samples(self) -> List[dict]:
+        """Return current reservoir"""
+        return self.reservoir.copy()
+
+    def get_stats(self) -> dict:
+        return {
+            'reservoir_size': len(self.reservoir),
+            'total_seen': self.count,
+            'sampling_rate': self.size / max(self.count, 1)
+        }
+
+# Global reservoir instance
+reservoir_sampler = ReservoirSampler()
+
+
+# -----------------------------------------------------------------------------
+# 1.2 FLAJOLET-MARTIN (Distinct Count Estimation)
+# -----------------------------------------------------------------------------
+class FlajoletMartin:
+    """
+    Flajolet-Martin Algorithm: Estimate distinct count using hash functions
+    Uses multiple hash functions for better accuracy
+    """
+
+    def __init__(self, num_hashes: int = 10):
+        self.num_hashes = num_hashes
+        self.max_zeros = [0] * num_hashes
+        self.actual_distinct = set()
+        # Generate random seeds for hash functions
+        self.seeds = [random.randint(0, 2**31) for _ in range(num_hashes)]
+
+    def _hash(self, item: str, seed: int) -> int:
+        """Hash function returning integer"""
+        h = hashlib.md5((str(seed) + item).encode()).hexdigest()
+        return int(h, 16)
+
+    def _trailing_zeros(self, n: int) -> int:
+        """Count trailing zeros in binary representation"""
+        if n == 0:
+            return 32
+        count = 0
+        while (n & 1) == 0:
+            count += 1
+            n >>= 1
+        return count
+
+    def add(self, item: str):
+        """Add item and update max trailing zeros"""
+        self.actual_distinct.add(item)
+
+        for i, seed in enumerate(self.seeds):
+            h = self._hash(item, seed)
+            zeros = self._trailing_zeros(h)
+            self.max_zeros[i] = max(self.max_zeros[i], zeros)
+
+    def estimate_distinct(self) -> int:
+        """Estimate distinct count using median of estimates"""
+        estimates = [2 ** r for r in self.max_zeros]
+        # Use median for robustness
+        estimates.sort()
+        median = estimates[len(estimates) // 2]
+        return int(median * 0.77351)  # Correction factor
+
+    def get_actual_distinct(self) -> int:
+        """Return actual distinct count for comparison"""
+        return len(self.actual_distinct)
+
+    def get_stats(self) -> dict:
+        estimated = self.estimate_distinct()
+        actual = self.get_actual_distinct()
+        error = abs(estimated - actual) / max(actual, 1) * 100
+        return {
+            'estimated_distinct': estimated,
+            'actual_distinct': actual,
+            'error_percentage': round(error, 2)
+        }
+
+# Global FM instances
+fm_articles = FlajoletMartin()
+fm_sources = FlajoletMartin()
+
+
+# -----------------------------------------------------------------------------
+# 1.3 DGIM (Counting 1s in Sliding Window)
+# -----------------------------------------------------------------------------
+class DGIM:
+    """
+    DGIM Algorithm: Count events in sliding window
+    Binary stream representation with bucket-based approximation
+    """
+
+    def __init__(self, window_size: int = 1000):
+        self.window_size = window_size
+        self.buckets = []  # List of (timestamp, size) tuples
+        self.current_time = 0
+
+    def add(self, bit: int):
+        """Add a bit to the stream"""
+        self.current_time += 1
+
+        # Remove expired buckets
+        self._remove_expired()
+
+        if bit == 1:
+            # Create new bucket of size 1
+            self.buckets.append((self.current_time, 1))
+            # Merge buckets if needed
+            self._merge_buckets()
+
+    def _remove_expired(self):
+        """Remove buckets outside the window"""
+        cutoff = self.current_time - self.window_size
+        self.buckets = [(t, s) for t, s in self.buckets if t > cutoff]
+
+    def _merge_buckets(self):
+        """Merge buckets to maintain DGIM invariant (at most 2 of each size)"""
+        i = len(self.buckets) - 1
+        while i >= 2:
+            # Check if we have 3 buckets of the same size
+            if (self.buckets[i][1] == self.buckets[i-1][1] == self.buckets[i-2][1]):
+                # Merge the two oldest
+                new_size = self.buckets[i-2][1] * 2
+                new_time = self.buckets[i-1][0]  # Keep newer timestamp
+                self.buckets[i-2] = (new_time, new_size)
+                del self.buckets[i-1]
+                i -= 1
+            else:
+                i -= 1
+
+    def count(self) -> int:
+        """Estimate count of 1s in current window"""
+        if not self.buckets:
+            return 0
+
+        total = 0
+        for i, (_, size) in enumerate(self.buckets):
+            if i == 0:
+                # Oldest bucket: count half
+                total += size // 2
+            else:
+                total += size
+        return total
+
+    def get_stats(self) -> dict:
+        return {
+            'estimated_count': self.count(),
+            'num_buckets': len(self.buckets),
+            'window_size': self.window_size,
+            'current_time': self.current_time
+        }
+
+# Global DGIM instances for different event types
+dgim_articles = DGIM(window_size=1000)
+dgim_positive_sentiment = DGIM(window_size=1000)
+dgim_negative_sentiment = DGIM(window_size=1000)
+
+
+# -----------------------------------------------------------------------------
+# 1.4 COMPUTING MOMENTS
+# -----------------------------------------------------------------------------
+class MomentsCalculator:
+    """
+    Computing Moments: Track frequency moments of news sources
+    - First moment (count): Total items
+    - Second moment (surprise index): Sum of squares of frequencies
+    """
+
+    def __init__(self):
+        self.frequencies = defaultdict(int)
+        self.total_count = 0
+
+    def add(self, source: str):
+        """Add item and update frequencies"""
+        self.frequencies[source] += 1
+        self.total_count += 1
+
+    def first_moment(self) -> int:
+        """M1 = sum of frequencies = total count"""
+        return self.total_count
+
+    def second_moment(self) -> int:
+        """M2 = sum of squares of frequencies (surprise index)"""
+        return sum(f ** 2 for f in self.frequencies.values())
+
+    def get_top_sources(self, n: int = 10) -> List[Tuple[str, int]]:
+        """Return top N sources by frequency"""
+        sorted_sources = sorted(
+            self.frequencies.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        return sorted_sources[:n]
+
+    def get_stats(self) -> dict:
+        m1 = self.first_moment()
+        m2 = self.second_moment()
+        return {
+            'first_moment': m1,
+            'second_moment': m2,
+            'unique_sources': len(self.frequencies),
+            'top_sources': dict(self.get_top_sources(5))
+        }
+
+# Global moments calculator
+moments_calc = MomentsCalculator()
+
+
+# =============================================================================
+# 2. LSH PIPELINE
+# =============================================================================
+
+class LSHPipeline:
+    """
+    Complete LSH Pipeline:
+    - Text Preprocessing (tokenization, lowercase, stopword removal)
+    - Shingling (3-5 word n-grams)
+    - MinHash (128 permutations)
+    - LSH Index (5 bands)
+    - Similarity detection (threshold 0.5)
+    """
+
+    STOPWORDS = {
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+        'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
+        'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+        'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'this',
+        'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they',
+        'what', 'which', 'who', 'whom', 'when', 'where', 'why', 'how', 'all',
+        'each', 'every', 'both', 'few', 'more', 'most', 'other', 'some', 'such',
+        'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very',
+        's', 't', 'just', 'don', 'now', 'as', 'if', 'its', 'into', 'over'
+    }
+
+    def __init__(self, num_hashes: int = NUM_HASH_FUNCTIONS,
+                 num_bands: int = NUM_BANDS,
+                 shingle_size: int = SHINGLE_SIZE):
+        self.num_hashes = num_hashes
+        self.num_bands = num_bands
+        self.rows_per_band = num_hashes // num_bands
+        self.shingle_size = shingle_size
+
+        # Generate hash function coefficients
+        self.hash_coeffs = [
+            (random.randint(1, 2**31), random.randint(0, 2**31))
+            for _ in range(num_hashes)
+        ]
+
+        # LSH buckets: {band_idx: {bucket_hash: [doc_ids]}}
+        self.lsh_buckets = defaultdict(lambda: defaultdict(list))
+
+        # Store signatures for similarity computation
+        self.signatures = {}
+
+        # Store document content for debugging
+        self.documents = {}
+
+    def preprocess(self, text: str) -> List[str]:
+        """
+        Preprocess text:
+        - Lowercase
+        - Remove punctuation
+        - Tokenize
+        - Remove stopwords
+        """
+        if not text:
+            return []
+
+        # Lowercase
+        text = text.lower()
+
+        # Remove punctuation
+        text = re.sub(r'[^\w\s]', '', text)
+
+        # Tokenize
+        words = text.split()
+
+        # Remove stopwords
+        words = [w for w in words if w not in self.STOPWORDS and len(w) > 1]
+
+        return words
+
+    def create_shingles(self, words: List[str]) -> Set[str]:
+        """Create n-gram shingles from words"""
+        if len(words) < self.shingle_size:
+            return {' '.join(words)} if words else set()
+
+        shingles = set()
+        for i in range(len(words) - self.shingle_size + 1):
+            shingle = ' '.join(words[i:i + self.shingle_size])
+            shingles.add(shingle)
+
+        return shingles
+
+    def minhash_signature(self, shingles: Set[str]) -> List[int]:
+        """Generate MinHash signature (128 hash functions)"""
+        if not shingles:
+            return [2**31] * self.num_hashes
+
+        signature = [float('inf')] * self.num_hashes
+
+        for shingle in shingles:
+            shingle_hash = int(hashlib.md5(shingle.encode()).hexdigest(), 16)
+
+            for i, (a, b) in enumerate(self.hash_coeffs):
+                # Hash function: (a * x + b) mod prime
+                h = (a * shingle_hash + b) % (2**31 - 1)
+                signature[i] = min(signature[i], h)
+
+        return [int(s) for s in signature]
+
+    def add_document(self, doc_id: str, text: str) -> List[int]:
+        """Process document and add to LSH index"""
+        # Preprocess
+        words = self.preprocess(text)
+
+        # Create shingles
+        shingles = self.create_shingles(words)
+
+        # Generate MinHash signature
+        signature = self.minhash_signature(shingles)
+
+        # Store signature
+        self.signatures[doc_id] = signature
+        self.documents[doc_id] = text[:200]  # Store truncated for debugging
+
+        # Add to LSH buckets
+        for band_idx in range(self.num_bands):
+            start = band_idx * self.rows_per_band
+            end = start + self.rows_per_band
+            band_signature = tuple(signature[start:end])
+            bucket_hash = hash(band_signature)
+            self.lsh_buckets[band_idx][bucket_hash].append(doc_id)
+
+        return signature
+
+    def find_candidates(self, doc_id: str) -> Set[str]:
+        """Find candidate similar documents"""
+        if doc_id not in self.signatures:
+            return set()
+
+        candidates = set()
+        signature = self.signatures[doc_id]
+
+        for band_idx in range(self.num_bands):
+            start = band_idx * self.rows_per_band
+            end = start + self.rows_per_band
+            band_signature = tuple(signature[start:end])
+            bucket_hash = hash(band_signature)
+
+            for candidate_id in self.lsh_buckets[band_idx][bucket_hash]:
+                if candidate_id != doc_id:
+                    candidates.add(candidate_id)
+
+        return candidates
+
+    def jaccard_similarity(self, sig1: List[int], sig2: List[int]) -> float:
+        """Estimate Jaccard similarity from MinHash signatures"""
+        if not sig1 or not sig2:
+            return 0.0
+        return sum(1 for a, b in zip(sig1, sig2) if a == b) / len(sig1)
+
+    def find_similar_pairs(self, threshold: float = SIMILARITY_THRESHOLD) -> List[dict]:
+        """Find all similar document pairs above threshold"""
+        similar_pairs = []
+        checked_pairs = set()
+
+        for doc_id in self.signatures:
+            candidates = self.find_candidates(doc_id)
+
+            for candidate_id in candidates:
+                pair_key = tuple(sorted([doc_id, candidate_id]))
+                if pair_key in checked_pairs:
+                    continue
+                checked_pairs.add(pair_key)
+
+                similarity = self.jaccard_similarity(
+                    self.signatures[doc_id],
+                    self.signatures[candidate_id]
+                )
+
+                if similarity >= threshold:
+                    similar_pairs.append({
+                        'article_id_1': doc_id,
+                        'article_id_2': candidate_id,
+                        'jaccard_similarity': round(similarity, 4),
+                        'detected_at': datetime.utcnow().isoformat()
+                    })
+
+        return similar_pairs
+
+# Global LSH pipeline instance
+lsh_pipeline = LSHPipeline()
+
+
+# =============================================================================
+# 3. PRIVACY TECHNIQUES
+# =============================================================================
+
+class PrivacyProcessor:
+    """
+    Privacy Techniques:
+    - K-Anonymity (k=5): Group by quasi-identifiers
+    - L-Diversity (l=3): Ensure diverse sensitive values
+    - Differential Privacy: Laplace mechanism (epsilon=0.5)
+    """
+
+    def __init__(self, k: int = K_ANONYMITY, l: int = L_DIVERSITY, epsilon: float = EPSILON):
+        self.k = k
+        self.l = l
+        self.epsilon = epsilon
+        self.noise_scale = 1.0 / epsilon
+
+    # -------------------------------------------------------------------------
+    # K-ANONYMITY
+    # -------------------------------------------------------------------------
+    def hash_author(self, author: str) -> str:
+        """Hash author name using SHA-256"""
+        if not author:
+            return "UNKNOWN"
+        salt = "newsexpress_salt_2024"
+        return hashlib.sha256((salt + author).encode()).hexdigest()[:16]
+
+    def generalize_timestamp(self, timestamp: str) -> str:
+        """Generalize timestamp to date level"""
+        if not timestamp:
+            return "UNKNOWN_DATE"
+        try:
+            # Parse ISO format timestamp
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            return dt.strftime('%Y-%m-%d')
+        except:
+            return timestamp[:10] if len(timestamp) >= 10 else "UNKNOWN_DATE"
+
+    def apply_k_anonymity(self, records: List[dict]) -> Tuple[List[dict], List[dict]]:
+        """
+        Apply K-Anonymity:
+        - Group by quasi-identifiers (source, date)
+        - Suppress groups with fewer than k records
+        Returns: (passing_records, suppressed_records)
+        """
+        # Group by quasi-identifiers
+        groups = defaultdict(list)
+
+        for record in records:
+            source = record.get('source_name', 'UNKNOWN')
+            date = self.generalize_timestamp(record.get('publishedAt', ''))
+            group_key = (source, date)
+            groups[group_key].append(record)
+
+        passing = []
+        suppressed = []
+
+        for group_key, group_records in groups.items():
+            if len(group_records) >= self.k:
+                # Apply transformations to passing records
+                for r in group_records:
+                    r['author_hashed'] = self.hash_author(r.get('author'))
+                    r['date_generalized'] = group_key[1]
+                    r['k_anonymity_group_size'] = len(group_records)
+                passing.extend(group_records)
+            else:
+                suppressed.extend(group_records)
+
+        return passing, suppressed
+
+    # -------------------------------------------------------------------------
+    # L-DIVERSITY
+    # -------------------------------------------------------------------------
+    def check_l_diversity(self, records: List[dict], sensitive_attr: str = 'category') -> Tuple[List[dict], List[dict]]:
+        """
+        Apply L-Diversity:
+        - Ensure l distinct sensitive values per group
+        - Suppress groups failing validation
+        Returns: (passing_records, suppressed_records)
+        """
+        # Group by quasi-identifiers
+        groups = defaultdict(list)
+
+        for record in records:
+            source = record.get('source_name', 'UNKNOWN')
+            date = record.get('date_generalized', 'UNKNOWN')
+            group_key = (source, date)
+            groups[group_key].append(record)
+
+        passing = []
+        suppressed = []
+
+        for group_key, group_records in groups.items():
+            # Count distinct sensitive values
+            sensitive_values = set()
+            for r in group_records:
+                val = r.get(sensitive_attr) or r.get('source_name', 'UNKNOWN')
+                sensitive_values.add(val)
+
+            if len(sensitive_values) >= self.l:
+                for r in group_records:
+                    r['l_diversity_count'] = len(sensitive_values)
+                passing.extend(group_records)
+            else:
+                suppressed.extend(group_records)
+
+        return passing, suppressed
+
+    # -------------------------------------------------------------------------
+    # DIFFERENTIAL PRIVACY
+    # -------------------------------------------------------------------------
+    def laplace_noise(self, sensitivity: float = 1.0) -> float:
+        """Generate Laplace noise"""
+        scale = sensitivity / self.epsilon
+        return np.random.laplace(0, scale)
+
+    def add_noise_to_count(self, count: int, sensitivity: float = 1.0) -> int:
+        """Add Laplace noise to count"""
+        noisy_count = count + self.laplace_noise(sensitivity)
+        return max(0, int(round(noisy_count)))
+
+    def compute_dp_counts(self, records: List[dict]) -> List[dict]:
+        """
+        Compute differentially private counts:
+        - Article counts per source
+        - Topic/category frequency counts
+        """
+        # Count by source
+        source_counts = defaultdict(int)
+        topic_counts = defaultdict(int)
+
+        for record in records:
+            source = record.get('source_name', 'UNKNOWN')
+            topic = record.get('category', 'general')
+            source_counts[source] += 1
+            topic_counts[topic] += 1
+
+        dp_results = []
+        timestamp = datetime.utcnow().isoformat()
+
+        # Add noise to source counts
+        for source, count in source_counts.items():
+            noisy_count = self.add_noise_to_count(count)
+            dp_results.append({
+                'count_type': 'source',
+                'category': source,
+                'true_count': count,
+                'noisy_count': noisy_count,
+                'epsilon': self.epsilon,
+                'timestamp': timestamp
+            })
+
+        # Add noise to topic counts
+        for topic, count in topic_counts.items():
+            noisy_count = self.add_noise_to_count(count)
+            dp_results.append({
+                'count_type': 'topic',
+                'category': topic,
+                'true_count': count,
+                'noisy_count': noisy_count,
+                'epsilon': self.epsilon,
+                'timestamp': timestamp
+            })
+
+        return dp_results
+
+# Global privacy processor
+privacy_processor = PrivacyProcessor()
+
+
+# =============================================================================
+# 4. SENTIMENT ANALYSIS
+# =============================================================================
+
+class SentimentAnalyzer:
+    """
+    Sentiment Analysis using TextBlob:
+    - Classification: Positive / Negative / Neutral
+    - Score range: -1.0 to 1.0
+    - Process title + description
+    """
+
+    @staticmethod
+    def analyze(text: str) -> dict:
+        """Analyze sentiment of text"""
+        if not text:
+            return {
+                'sentiment_score': 0.0,
+                'sentiment_label': 'NEUTRAL',
+                'subjectivity': 0.0
+            }
+
+        blob = TextBlob(text)
+        polarity = blob.sentiment.polarity
+        subjectivity = blob.sentiment.subjectivity
+
+        # Classify
+        if polarity > 0.1:
+            label = 'POSITIVE'
+        elif polarity < -0.1:
+            label = 'NEGATIVE'
+        else:
+            label = 'NEUTRAL'
+
+        return {
+            'sentiment_score': round(polarity, 4),
+            'sentiment_label': label,
+            'subjectivity': round(subjectivity, 4)
+        }
+
+    @staticmethod
+    def analyze_article(article: dict) -> dict:
+        """Analyze sentiment of article (title + description)"""
+        title = article.get('title', '') or ''
+        description = article.get('description', '') or ''
+        combined = f"{title}. {description}"
+
+        result = SentimentAnalyzer.analyze(combined)
+        article.update(result)
+        return article
+
+# Global sentiment analyzer
+sentiment_analyzer = SentimentAnalyzer()
+
+
+# =============================================================================
+# 5. SPARK STREAMING SETUP
+# =============================================================================
+
+# Create Spark Session
 spark = SparkSession.builder \
-    .appName("KafkaToBigQuery") \
+    .appName("NewsExpress-StreamProcessor") \
     .config("spark.jars.packages", PACKAGES) \
     .config("spark.jars", GCS_JAR_PATH) \
-    .config("spark.driver.extraClassPath", GCS_JAR_PATH) \
-    .config("spark.executor.extraClassPath", GCS_JAR_PATH) \
+    .config("spark.sql.streaming.checkpointLocation", f"gs://{TEMP_BUCKET}/checkpoints/") \
     .getOrCreate()
 
-# Define schema
-schema = StructType([
+spark.sparkContext.setLogLevel("WARN")
+
+# Input Schema (NewsAPI format)
+input_schema = StructType([
     StructField("source", StructType([
-        StructField("id",   StringType()),
+        StructField("id", StringType()),
         StructField("name", StringType())
     ])),
-    StructField("author",      StringType()),
-    StructField("title",       StringType()),
+    StructField("author", StringType()),
+    StructField("title", StringType()),
     StructField("description", StringType()),
+    StructField("url", StringType()),
+    StructField("urlToImage", StringType()),
     StructField("publishedAt", StringType()),
-    StructField("content",     StringType()),  # Added field
-    StructField("url",         StringType()),  # Added field
-    StructField("urlToImage",  StringType())   # Added field
+    StructField("content", StringType()),
+    StructField("_ingested_at", StringType()),
+    StructField("_source_api", StringType())
 ])
 
+
+# =============================================================================
+# 6. BATCH PROCESSING FUNCTION
+# =============================================================================
+
+def process_batch(batch_df: DataFrame, batch_id: int):
+    """
+    Process each micro-batch:
+    1. Parse and transform data
+    2. Apply streaming algorithms
+    3. Apply LSH for similarity detection
+    4. Apply privacy techniques
+    5. Apply sentiment analysis
+    6. Write to BigQuery tables
+    """
+
+    if batch_df.count() == 0:
+        print(f"Batch {batch_id}: Empty batch, skipping...")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"Processing Batch {batch_id} - {datetime.utcnow().isoformat()}")
+    print(f"{'='*60}")
+
+    # Convert to list of dicts for processing
+    records = []
+    for row in batch_df.collect():
+        try:
+            record = {
+                'uuid': str(uuid.uuid4()),
+                'source_id': row.source.id if row.source else None,
+                'source_name': row.source.name if row.source else 'UNKNOWN',
+                'author': row.author,
+                'title': row.title,
+                'description': row.description,
+                'url': row.url,
+                'urlToImage': row.urlToImage,
+                'publishedAt': row.publishedAt,
+                'content': row.content,
+                'ingested_at': row._ingested_at,
+                'processed_at': datetime.utcnow().isoformat()
+            }
+            records.append(record)
+        except Exception as e:
+            print(f"Error parsing record: {e}")
+            continue
+
+    if not records:
+        print("No valid records to process")
+        return
+
+    print(f"Records in batch: {len(records)}")
+
+    # -------------------------------------------------------------------------
+    # STREAMING ALGORITHMS
+    # -------------------------------------------------------------------------
+    print("\n--- Applying Streaming Algorithms ---")
+
+    for record in records:
+        # Reservoir Sampling
+        reservoir_sampler.add(record.copy())
+
+        # Flajolet-Martin
+        fm_articles.add(record['uuid'])
+        fm_sources.add(record['source_name'])
+
+        # DGIM (track article arrivals as 1s)
+        dgim_articles.add(1)
+
+        # Computing Moments
+        moments_calc.add(record['source_name'])
+
+    # Log streaming algorithm stats
+    print(f"  Reservoir: {reservoir_sampler.get_stats()}")
+    print(f"  FM Articles: {fm_articles.get_stats()}")
+    print(f"  FM Sources: {fm_sources.get_stats()}")
+    print(f"  DGIM: {dgim_articles.get_stats()}")
+    print(f"  Moments: {moments_calc.get_stats()}")
+
+    # -------------------------------------------------------------------------
+    # SENTIMENT ANALYSIS
+    # -------------------------------------------------------------------------
+    print("\n--- Applying Sentiment Analysis ---")
+
+    positive_count = 0
+    negative_count = 0
+    neutral_count = 0
+
+    for record in records:
+        sentiment_analyzer.analyze_article(record)
+
+        if record['sentiment_label'] == 'POSITIVE':
+            positive_count += 1
+            dgim_positive_sentiment.add(1)
+            dgim_negative_sentiment.add(0)
+        elif record['sentiment_label'] == 'NEGATIVE':
+            negative_count += 1
+            dgim_positive_sentiment.add(0)
+            dgim_negative_sentiment.add(1)
+        else:
+            neutral_count += 1
+            dgim_positive_sentiment.add(0)
+            dgim_negative_sentiment.add(0)
+
+    print(f"  Positive: {positive_count}, Negative: {negative_count}, Neutral: {neutral_count}")
+
+    # -------------------------------------------------------------------------
+    # LSH PIPELINE
+    # -------------------------------------------------------------------------
+    print("\n--- Applying LSH Pipeline ---")
+
+    import time
+    lsh_start = time.time()
+
+    for record in records:
+        text = f"{record['title'] or ''} {record['description'] or ''}"
+        signature = lsh_pipeline.add_document(record['uuid'], text)
+        record['lsh_signature'] = signature[:10]  # Store first 10 for reference
+
+    # Find similar pairs
+    similar_pairs = lsh_pipeline.find_similar_pairs(threshold=SIMILARITY_THRESHOLD)
+
+    lsh_time = (time.time() - lsh_start) * 1000 / max(len(records), 1)
+    print(f"  LSH processing time: {lsh_time:.2f}ms per article")
+    print(f"  Similar pairs found: {len(similar_pairs)}")
+
+    # -------------------------------------------------------------------------
+    # PRIVACY TECHNIQUES
+    # -------------------------------------------------------------------------
+    print("\n--- Applying Privacy Techniques ---")
+
+    # K-Anonymity
+    k_passing, k_suppressed = privacy_processor.apply_k_anonymity(records)
+    print(f"  K-Anonymity (k={K_ANONYMITY}): {len(k_passing)} passing, {len(k_suppressed)} suppressed")
+
+    # L-Diversity (on passing records)
+    l_passing, l_suppressed = privacy_processor.check_l_diversity(k_passing)
+    print(f"  L-Diversity (l={L_DIVERSITY}): {len(l_passing)} passing, {len(l_suppressed)} suppressed")
+
+    # Differential Privacy counts
+    dp_counts = privacy_processor.compute_dp_counts(records)
+    print(f"  DP Counts (epsilon={EPSILON}): {len(dp_counts)} entries")
+
+    # -------------------------------------------------------------------------
+    # WRITE TO BIGQUERY
+    # -------------------------------------------------------------------------
+    print("\n--- Writing to BigQuery ---")
+
+    try:
+        # 1. Write main news table (with privacy applied)
+        if l_passing:
+            news_df = spark.createDataFrame(l_passing)
+            news_df.write \
+                .format("bigquery") \
+                .option("table", f"{BQ_DATASET_ID}.news_table") \
+                .option("temporaryGcsBucket", TEMP_BUCKET) \
+                .mode("append") \
+                .save()
+            print(f"  news_table: {len(l_passing)} records written")
+
+        # 2. Write similarity table
+        if similar_pairs:
+            sim_df = spark.createDataFrame(similar_pairs)
+            sim_df.write \
+                .format("bigquery") \
+                .option("table", f"{BQ_DATASET_ID}.similarity_table") \
+                .option("temporaryGcsBucket", TEMP_BUCKET) \
+                .mode("append") \
+                .save()
+            print(f"  similarity_table: {len(similar_pairs)} pairs written")
+
+        # 3. Write DP counts table
+        if dp_counts:
+            dp_df = spark.createDataFrame(dp_counts)
+            dp_df.write \
+                .format("bigquery") \
+                .option("table", f"{BQ_DATASET_ID}.dp_counts_table") \
+                .option("temporaryGcsBucket", TEMP_BUCKET) \
+                .mode("append") \
+                .save()
+            print(f"  dp_counts_table: {len(dp_counts)} entries written")
+
+        # 4. Write reservoir samples periodically
+        if batch_id % 10 == 0:  # Every 10 batches
+            samples = reservoir_sampler.get_samples()
+            if samples:
+                sample_df = spark.createDataFrame(samples)
+                sample_df.write \
+                    .format("bigquery") \
+                    .option("table", f"{BQ_DATASET_ID}.sample_table") \
+                    .option("temporaryGcsBucket", TEMP_BUCKET) \
+                    .mode("overwrite") \
+                    .save()
+                print(f"  sample_table: {len(samples)} samples written")
+
+        # 5. Write sentiment results
+        sentiment_records = [{
+            'uuid': r['uuid'],
+            'title': r['title'],
+            'source_name': r['source_name'],
+            'sentiment_score': r['sentiment_score'],
+            'sentiment_label': r['sentiment_label'],
+            'subjectivity': r['subjectivity'],
+            'processed_at': r['processed_at']
+        } for r in records]
+
+        if sentiment_records:
+            sent_df = spark.createDataFrame(sentiment_records)
+            sent_df.write \
+                .format("bigquery") \
+                .option("table", f"{BQ_DATASET_ID}.news_with_sentiment") \
+                .option("temporaryGcsBucket", TEMP_BUCKET) \
+                .mode("append") \
+                .save()
+            print(f"  news_with_sentiment: {len(sentiment_records)} records written")
+
+        print(f"\nBatch {batch_id} completed successfully!")
+
+    except Exception as e:
+        print(f"Error writing to BigQuery: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+# =============================================================================
+# 7. MAIN STREAMING QUERY
+# =============================================================================
+
 # Read from Kafka
-df = spark.readStream \
+raw_stream = spark.readStream \
     .format("kafka") \
-    .option("kafka.bootstrap.servers", kafka_broker) \
-    .option("subscribe", kafka_topic) \
+    .option("kafka.bootstrap.servers", KAFKA_BROKER) \
+    .option("subscribe", KAFKA_TOPIC) \
     .option("startingOffsets", "earliest") \
+    .option("failOnDataLoss", "false") \
     .load()
 
-# Parse JSON payload
-json_df = df.selectExpr("CAST(value AS STRING) as json") \
-    .select(from_json(col("json"), schema).alias("data")) \
+# Parse JSON
+parsed_stream = raw_stream \
+    .selectExpr("CAST(value AS STRING) as json") \
+    .select(from_json(col("json"), input_schema).alias("data")) \
     .select("data.*")
 
-# Add a deterministic UUID column using SHA-256 hash of the concatenated fields
-json_df = json_df.withColumn("uuid", sha2(concat_ws("||", col("title"), col("publishedAt"), col("source.name")), 256))
-# Add ingestion time
-json_df = json_df.withColumn("ingestion_time", current_timestamp())
-
-# Initialize BigQuery client 
-client = bigquery.Client()
-
-create_target_query = f"""
-CREATE TABLE IF NOT EXISTS `{bq_dataset_id}.{table_name}` (
-    uuid STRING,
-    title STRING,
-    publishedAt STRING,
-    description STRING,
-    author STRING,    
-    content STRING,
-    url STRING,
-    urlToImage STRING,
-    source STRUCT<id STRING, name STRING>,
-    ingestion_time TIMESTAMP
-)
-"""
-
-try:
-    client.query(create_target_query).result()
-except Exception as e:
-    print(f"Error creating table: {e}")
-
-print("Target table ensured.")
-
-
-# Deduplication function to run after each batch write (MERGE approach)
-def deduplicate_in_bigquery():
-    query = f"""
-    MERGE INTO `{bq_dataset_id}.{table_name}` T
-    USING (
-        SELECT * FROM (
-            SELECT 
-                uuid, 
-                title, 
-                publishedAt, 
-                description, 
-                author, 
-                content, 
-                url, 
-                urlToImage, 
-                source, 
-                ingestion_time,
-                ROW_NUMBER() OVER (PARTITION BY uuid ORDER BY ingestion_time DESC) AS row_num
-            FROM `{bq_dataset_id}.{table_name}_staging`
-        )
-        WHERE row_num = 1
-    ) S
-    ON T.uuid = S.uuid
-    WHEN MATCHED THEN
-        UPDATE SET
-            T.title = S.title, 
-            T.publishedAt = S.publishedAt, 
-            T.description = S.description, 
-            T.author = S.author, 
-            T.content = S.content,
-            T.url = S.url,
-            T.urlToImage = S.urlToImage,
-            T.source = S.source,
-            T.ingestion_time = S.ingestion_time
-    WHEN NOT MATCHED THEN
-        INSERT (uuid, title, publishedAt, description, author, content, url, urlToImage, source, ingestion_time)
-        VALUES (S.uuid, S.title, S.publishedAt, S.description, S.author, S.content, S.url, S.urlToImage, S.source, S.ingestion_time)
-    """
-    
-    # Run the deduplication query
-    try:
-        query_job = client.query(query)
-        query_job.result()
-    except Exception as e:
-        print(f"Error during BigQuery operation: {e}")
-
-    delete_staging_query = f"""
-    DELETE FROM `{bq_dataset_id}.{table_name}_staging`
-    WHERE ingestion_time < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 DAY);
-    """    
-
-    try:
-        client.query(delete_staging_query).result()
-        print("Staging table cleaned up.")
-    except Exception as e:
-        print(f"Error deleting staging records: {e}")
-
-    print("Deduplication and cleanup completed in BigQuery.")
-
-
-def write_batch_to_bq(batch_df, batch_id):
-    # Write the batch data to BigQuery staging table
-    batch_df.write \
-        .format("bigquery") \
-        .option("table", f"{bq_dataset_id}.{table_name}_staging") \
-        .option("temporaryGcsBucket", temp_bucket) \
-        .mode("append") \
-        .save()
-
-    # Deduplicate in BigQuery after each batch write
-    deduplicate_in_bigquery()
-
-# Start streaming to BigQuery
-query = json_df.writeStream \
-    .outputMode("append") \
-    .option("checkpointLocation", f"gs://{temp_bucket}/bq_checkpoints/") \
-    .foreachBatch(write_batch_to_bq) \
+# Start streaming with 30-minute trigger (as per requirements)
+query = parsed_stream.writeStream \
+    .foreachBatch(process_batch) \
     .trigger(processingTime="30 minutes") \
+    .option("checkpointLocation", f"gs://{TEMP_BUCKET}/checkpoints/newsexpress/") \
     .start()
 
-# Await termination
+print("\n" + "="*60)
+print("NewsExpress Stream Processor Started")
+print("="*60)
+print(f"Kafka Broker: {KAFKA_BROKER}")
+print(f"Kafka Topic: {KAFKA_TOPIC}")
+print(f"BigQuery Dataset: {BQ_DATASET_ID}")
+print(f"Trigger Interval: 30 minutes")
+print(f"Privacy: K={K_ANONYMITY}, L={L_DIVERSITY}, Epsilon={EPSILON}")
+print(f"LSH: {NUM_HASH_FUNCTIONS} hashes, {NUM_BANDS} bands, threshold={SIMILARITY_THRESHOLD}")
+print("="*60 + "\n")
+
 query.awaitTermination()

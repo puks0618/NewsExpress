@@ -1,0 +1,7 @@
+kafka_python_package: kafka-python
+kafka_broker: "172.20.2.3:9092"
+kafka_topic: "news-stream"
+producer_script_dest: "/opt/kafka_producer"
+
+
+

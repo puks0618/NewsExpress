@@ -15,6 +15,12 @@ resource "google_storage_bucket_iam_member" "bq_temp_writer" {
   member = "serviceAccount:${google_service_account.bq_service_account.email}"
 }
 
+resource "google_storage_bucket_iam_member" "bq_bucket_reader" {
+  bucket = var.temp_bucket_name
+  role   = "roles/storage.legacyBucketReader"
+  member = "serviceAccount:${google_service_account.bq_service_account.email}"
+}
+
 resource "google_project_iam_member" "bq_job_user" {
   project = var.project_id
   role    = "roles/bigquery.jobUser"

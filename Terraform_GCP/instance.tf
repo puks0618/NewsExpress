@@ -16,7 +16,7 @@ resource "google_compute_instance" "kafka_instance" {
   }
 
   metadata = {
-    ssh-keys = "kaanevran:${file("../keys/kfk-key.pub")}"
+    ssh-keys = "jey:${file("../keys/kfk-key.pub")}"
   }
 }
 
@@ -38,7 +38,7 @@ resource "google_compute_instance" "stream_producer_instance" {
   }
 
   metadata = {
-    ssh-keys = "kaanevran:${file("../keys/strm-key.pub")}"
+    ssh-keys = "jey:${file("../keys/strm-key.pub")}"
   }
   /*
   metadata_startup_script = <<-EOT
@@ -74,7 +74,7 @@ resource "google_compute_instance" "consumer_instance" {
   }
 
   metadata = {
-    ssh-keys = "kaanevran:${file("../keys/cnsmr-key.pub")}"
+    ssh-keys = "jey:${file("../keys/cnsmr-key.pub")}"
   }
 }
 
@@ -98,19 +98,19 @@ resource "google_compute_instance" "control_instance" {
   }
 
   metadata = {
-    ssh-keys = "kaanevran:${file("../keys/control-key.pub")}"
+    ssh-keys = "jey:${file("../keys/control-key.pub")}"
   }
 
   connection {
     type        = "ssh"
-    user        = "kaanevran"                 # Replace USERNAME
+    user        = "jey"                 # Replace USERNAME
     private_key = file("../keys/control-key") # Path to your private key for SSH
     host        = self.network_interface.0.access_config.0.nat_ip
   }
 
   provisioner "remote-exec" {
     inline = [
-      "mkdir -p /home/kaanevran/keys"
+      "mkdir -p /home/jey/keys"
     ]
   }
 
@@ -118,12 +118,12 @@ resource "google_compute_instance" "control_instance" {
 
   provisioner "file" {
     source      = "../keys/"
-    destination = "/home/kaanevran/keys/" # Replace USERNAME with the actual username
+    destination = "/home/jey/keys/" # Replace USERNAME with the actual username
   }
 
   provisioner "remote-exec" {
     inline = [
-      "chmod 600 /home/kaanevran/keys/*"
+      "chmod 600 /home/jey/keys/*"
     ]
   }
   /*

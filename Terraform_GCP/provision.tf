@@ -6,7 +6,7 @@ resource "null_resource" "provision_control_server" {
 
   connection {
     type        = "ssh"
-    user        = "kaanevran"
+    user        = "jey"
     private_key = file("../keys/control-key")
     host        = google_compute_instance.control_instance.network_interface.0.access_config.0.nat_ip
   }
@@ -14,19 +14,19 @@ resource "null_resource" "provision_control_server" {
 
   provisioner "remote-exec" {
     inline = [
-      "mkdir -p /home/kaanevran/ansible_files"
+      "mkdir -p /home/jey/ansible_files"
     ]
   }
 
   provisioner "file" {
     source      = "../ansible_files/"
-    destination = "/home/kaanevran/ansible_files/"
+    destination = "/home/jey/ansible_files/"
   }
 
   provisioner "remote-exec" {
     inline = [
-      "sudo chmod -R 755 /home/kaanevran/ansible_files/",
-      "sudo chmod 600 /home/kaanevran/ansible_files/keys/*"
+      "sudo chmod -R 755 /home/jey/ansible_files/",
+      "ln -sf /home/jey/keys /home/jey/ansible_files/keys"
     ]
   }
 }
@@ -39,7 +39,7 @@ resource "null_resource" "install_ansible" {
 
   connection {
     type        = "ssh"
-    user        = "kaanevran"
+    user        = "jey"
     private_key = file("../keys/control-key")
     host        = google_compute_instance.control_instance.network_interface.0.access_config.0.nat_ip
   }
